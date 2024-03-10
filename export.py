@@ -1,5 +1,5 @@
 import json
-import sqlite3
+import os
 import sys
 import time
 from argparse import ArgumentParser
@@ -10,17 +10,20 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from sys import stderr
 from typing import Iterable, Mapping, Dict, Tuple, Optional
+from urllib.parse import urlparse
 
-import pandas
 import requests
 from pandas import DataFrame
 from steam.client import SteamClient  # noqa
 from steam.steamid import SteamID
 from tqdm import tqdm
 
-from helpers import TmpFile, one_way_sync, read_json_gz_file, write_json_gz_file, split_chunks
-from platforms.steam import Category, SteamAPI
+from helpers import TmpFile, one_way_sync, read_json_gz_file, write_json_gz_file
+from platforms.gog import GOG
 from platforms.platforms import PLATFORMS
+from platforms.steam import SteamAPI, PublicSteamAPI
+from platforms.steam_info import SteamCategory, STEAM_IMG_BASE_URL
+from platforms.types import GameInfoRow, FriendsInfoRow
 
 SCRIPT_DIR = Path(__file__).parent
 DIST_DIR = SCRIPT_DIR / 'dist'
@@ -40,8 +43,9 @@ class ImageCache:
 
     def path(self, url: str) -> Path:
         if url not in self._locations:
+            extension = urlparse(url).path.split('.')[-1].lower()
             digest = sha256(url.encode("utf-8")).hexdigest()
-            self._locations[url] = CACHE_DIR / digest[0] / digest[:2] / f'{digest}.webp'
+            self._locations[url] = CACHE_DIR / digest[0] / digest[:2] / f'{digest}.{extension}'
         return self._locations[url]
 
     def rel_path(self, url: str) -> Path:
@@ -73,14 +77,17 @@ def create_parent_dirs(missing_images: Iterable[Path]):
         f.mkdir(exist_ok=True, parents=True)
 
 
-def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends=None):
+def run(*, gog_db, tags=False, steam_id=None, steam_api_key=None, all_friends=False, friends=None) -> None:
     export_time = datetime.now().strftime("%d.%m.%Y %H:%M")
     CACHE_DIR.mkdir(exist_ok=True)
+    gog = GOG(gog_db)
 
-    df = read_gog_database(gog_db)
+    print("Reading GOG database…", end=" ")
+    df = gog.read_games_database()
+    print("done")
     steam_db = get_steam_metadata(df)
 
-    def get_steam_id(ids):
+    def get_steam_game_id(ids):
         for game_id in sorted(ids, key=lambda x: int(x)):
             if game_id in steam_db and steam_db[game_id] and not steam_db[game_id]['_missing_token']:
                 return game_id
@@ -97,24 +104,31 @@ def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends
         categories = set()
         if info is not None and 'category' in info['common']:
             for c in info['common']['category'].keys():
+                num = int(c.replace('category_', ''))
                 try:
-                    categories.add(Category(int(c.replace('category_', ''))))
+                    categories.add(SteamCategory(num))
                 except:
-                    if c not in unknown_categories:
-                        print('Unknown Steam category', c.replace('category_', ''), file=stderr)
-                        unknown_categories.add(c)
+                    unknown_categories.add(num)
         return categories
 
-    friends_info, game_friends = get_friends_info(all_friends, friends, steam_api_key, steam_id)
+    friends_info, game_friends = get_friends_info(gog, all_friends, friends, steam_api_key, steam_id)
 
-    df['steam_id'] = df['steam_ids'].apply(get_steam_id)
+    df['steam_id'] = df['steam_ids'].apply(get_steam_game_id)
     df['info'] = df.apply(get_game_info, axis=1)
     df['categories'] = df['info'].apply(get_categories)
     df['icon_rel'] = df['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
     df['cover_rel'] = df['cover'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
 
+    if len(unknown_categories):
+        print(r'  ! Unknown Steam categories', ', '.join(str(c) for c in sorted(unknown_categories)), file=sys.stderr)
+
     friends_info['icon_rel'] = friends_info['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
-    images = [*df['icon'].dropna(), *df['cover'].dropna(), *friends_info['icon'].dropna()]
+    images = [
+        *df['icon'].dropna(),
+        *df['cover'].dropna(),
+        *friends_info['icon'].dropna(),
+        *(STEAM_IMG_BASE_URL + e.icon_url for e in SteamCategory)
+    ]
 
     download_missing_images(images)
 
@@ -123,16 +137,17 @@ def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends
     DIST_IMG_DIR.mkdir(exist_ok=True)
     one_way_sync(CACHE_DIR, DIST_IMG_DIR, (IMAGE_CACHE.rel_path(i) for i in images))
     one_way_sync(RES_DIR, DIST_RES_DIR, (f.relative_to(RES_DIR) for f in RES_DIR.iterdir() if f.is_file()))
+    row: GameInfoRow
     games_dump = [dict(
         title=row.title,
         icon=str('img' / row.icon_rel).replace('\\', '/') if row.icon else None,
         cover=str('img' / row.cover_rel).replace('\\', '/') if row.cover else None,
         platforms=row.platforms,
         categories=dict(
-            single=Category.SINGLEPLAYER in row.categories,
-            multi=Category.MULTIPLAYER in row.categories,
-            coop=Category.COOP in row.categories or Category.ONLINE_COOP in row.categories,
-            pvp=Category.PVP in row.categories or Category.ONLINE_PVP in row.categories
+            single=SteamCategory.SINGLE_PLAYER in row.categories,
+            multi=SteamCategory.MULTI_PLAYER in row.categories,
+            coop=SteamCategory.CO_OP in row.categories or SteamCategory.ONLINE_CO_OP in row.categories,
+            pvp=SteamCategory.PVP in row.categories or SteamCategory.ONLINE_PVP in row.categories
         ) if row.info else False,
         gameTime=row.game_time,
         lastPlayed=row.last_played,
@@ -142,11 +157,17 @@ def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends
         steamId=row.steam_id,
         allReleases=row.all_releases,
         hide=row.hide,
+        tags=row.tags if tags else [],
+        releaseDate=min((int(r) for r in [
+            row.meta.get('releaseDate'),
+            row.info.get('common', {}).get('steam_release_date') if row.info else None
+        ] if r is not None), default=None),
     ) for row in df.itertuples()]
-    friends_dump = {row.Index: dict(
-        name=row.name,
-        icon=str('img' / row.icon_rel).replace('\\', '/') if row.icon else None
-    ) for row in friends_info.itertuples()}
+    friend_row: FriendsInfoRow
+    friends_dump = {friend_row.Index: dict(
+        name=friend_row.name,
+        icon=str('img' / friend_row.icon_rel).replace('\\', '/') if friend_row.icon else None
+    ) for friend_row in friends_info.itertuples()}
     platforms_dump = {p.key: p.name for p in PLATFORMS.values()}
     num_games = (df['hide'] == False).sum()
     hidden_games = df['hide'].sum()
@@ -165,6 +186,7 @@ def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends
         json.dump(games_dump, report)
         report.write(f';\n')
         report.write(f'const showFriends = {"true" if friends or all_friends else "false"};\n')
+        report.write(f'const showTags = {"true" if tags else "false"};\n')
         report.write(f'const friendsInfo = ')
         json.dump(friends_dump, report)
         report.write(';\nconst platformsInfo = ')
@@ -193,58 +215,6 @@ def run(*, gog_db, steam_id=None, steam_api_key=None, all_friends=False, friends
         )
 
 
-def read_gog_database(path):
-    print("Reading GOG database… ", end="")
-    with sqlite3.connect(path) as con:
-        query = '''
-WITH l AS (SELECT releaseKey, "type" t, "value" v
-FROM ProductPurchaseDates links
-JOIN GamePieces gp ON links.gameReleaseKey = gp.releaseKey
-JOIN GamePieceTypes gpt ON gp.gamePieceTypeId = gpt.id),
-r AS (SELECT releaseKey,
-SUBSTR(releaseKey, 0, INSTR(releaseKey, '_')) platform,
-MIN(CASE WHEN t = 'title' THEN json_extract(v, '$.title') END) AS title,
-MAX(CASE WHEN t = 'myRating' THEN json_extract(v, '$.myRating') END) AS rating,
-MIN(CASE WHEN t = 'allGameReleases' THEN v END) AS allGameReleases,
-MAX(CASE WHEN t = 'originalImages' THEN v END) AS images,
-MAX(CASE WHEN t = 'meta' THEN v END) AS meta,
-MAX(CASE WHEN t = 'summary' THEN json_extract(v, '$.summary') END) AS summary
-FROM l
-GROUP BY releaseKey),
-steam_releases AS (SELECT allGameReleases, NULLIF(CAST(SUBSTR(json_each.value, 7) AS INTEGER), 0) steamRelease FROM
-r, json_each(r.allGameReleases, '$.releases')
-WHERE json_each.value LIKE 'steam%')
-SELECT
-title,
-SUM(times.minutesInGame) game_time,
-MAX(lastPlayedDate) last_played,
-IFNULL(MAX(rating), 0) rating,
-MAX(summary) summary,
-GROUP_CONCAT(DISTINCT platform) platforms,
-json_extract(MAX(images), '$.squareIcon') icon,
-json_extract(MAX(images), '$.verticalCover') cover,
-GROUP_CONCAT(DISTINCT steamRelease) steam_ids,
-json_extract(allGameReleases, '$.releases') all_releases
-FROM r
-LEFT JOIN steam_releases USING (allGameReleases)
-LEFT JOIN GameTimes times USING (releaseKey)
-LEFT JOIN LastPlayedDates lastPlayed ON releaseKey = lastPlayed.gameReleaseKey
-LEFT JOIN ReleaseProperties prop USING (releaseKey)
-LEFT JOIN ProductPurchaseDates purchase ON releaseKey = purchase.gameReleaseKey
-LEFT JOIN UserReleaseProperties userProps USING (releaseKey)
-GROUP BY allGameReleases
-HAVING IFNULL(MAX(prop.isVisibleInLibrary), 1) > 0 AND IFNULL(MAX(prop.isDlc), 0) < 1 AND IFNULL(MAX(userProps.isHidden), 0) < 1
--- AND NOT (Platforms = 'xboxone' AND game_time = 0 AND last_played IS NULL)  -- Xbox Game Pass
-ORDER BY title
-'''
-        df = pandas.read_sql_query(query, con)
-        df['steam_ids'] = df['steam_ids'].apply(lambda x: x.split(',') if x else [])
-        df['all_releases'] = df['all_releases'].apply(lambda x: json.loads(x))
-        df['hide'] = (df['rating'] == 0) & (df['last_played'].isnull()) & (df['game_time'] == 0)
-    print("done")
-    return df
-
-
 def get_steam_metadata(games_df):
     # Retrieve missing Steam metadata
     if STEAM_DB_CACHE.is_file():
@@ -256,9 +226,8 @@ def get_steam_metadata(games_df):
     missing_apps = [int(a) for ids in games_df['steam_ids']
                     for a in ids if a not in steam_db]
     if len(missing_apps):
-        print(f"Downloading Steam metadata for {len(missing_apps)} apps… ", end='')
-        client = SteamClient()
-        client.anonymous_login()
+        print(f"Downloading Steam metadata for {len(missing_apps)} apps…")
+        client = PublicSteamAPI()
         steam_data = client.get_product_info(apps=missing_apps)
         retrieve_stamp = int(time.time())
         for a in missing_apps:
@@ -272,11 +241,15 @@ def get_steam_metadata(games_df):
     return steam_db
 
 
-def get_friends_info(all_friends: bool, friends: Optional[Iterable[str]],
+def get_friends_info(gog: GOG, all_friends: bool, friends: Optional[Iterable[str]],
                      steam_api_key: Optional[str], steam_id: Optional[str]) -> Tuple[DataFrame, Mapping[str, list]]:
     game_friends = defaultdict(list)
     friends_info = {}
     if friends or all_friends:
+        if steam_id is None:
+            steam_id = gog.get_linked_steam_account_id()
+            if steam_id is None:
+                raise ValueError('Steam ID is not set and could not be retrieved from the GOG database')
         my_id = SteamID(steam_id)
         if not my_id.is_valid():
             my_id = SteamID.from_url(f'https://steamcommunity.com/id/{steam_id}')
@@ -296,19 +269,22 @@ def get_friends_info(all_friends: bool, friends: Optional[Iterable[str]],
                           or steam_friends_info[f.steamid]['personaname'] in friends_filter
                           or any(p in friends_filter for p in steam_ids(f['steamid']))
                           or steam_friends_info[f['steamid']].profileurl
-                              .replace('https://steamcommunity.com/id/', '')
-                              .rtrim('/') in friends_filter]
+                          .replace('https://steamcommunity.com/id/', '')
+                          .rtrim('/') in friends_filter]
         print("done")
+        not_sharing = []
         for f in tqdm(my_friends, desc="Retrieve friends' game lists"):
             resp = api.get_owned_games(f['steamid'])
             if 'games' in resp:
                 for a in resp['games']:
                     game_friends[f'steam_{a["appid"]}'].append(f'steam_{f["steamid"]}')
             else:
-                tqdm.write(steam_friends_info[f['steamid']]['personaname'] + ' does not share their game collection')
+                not_sharing.append(steam_friends_info[f['steamid']]['personaname'])
                 steam_friends_info.pop(f['steamid'])
         friends_info.update((f'steam_{k}', dict(name=info['personaname'], icon=info['avatar'], platform='steam'))
                             for k, info in steam_friends_info.items())
+        if len(not_sharing):
+            print('  ! Some friends do not share their game collection: ' + ', '.join(not_sharing), file=stderr)
     if len(friends_info):
         friends_info = DataFrame.from_dict(friends_info, 'index')
     else:
@@ -317,7 +293,7 @@ def get_friends_info(all_friends: bool, friends: Optional[Iterable[str]],
 
 
 def download_missing_images(images: Iterable[str]):
-    # Download missing images
+    """Download missing images"""
     missing_images = [i for i in set(images) if not IMAGE_CACHE.path(i).exists()]
     if len(missing_images):
         print("Downloading missing images…")
@@ -331,23 +307,34 @@ if __name__ == '__main__':
     parser = ArgumentParser(
         description='Export a game list from GOG Galaxy as an HTML page.\n'
                     'The HTML page is located in the dist folder as well as all resources (e.g. game covers).',
-        epilog='When using --friends or --all-friends, both --steam-id and --steam-api-key must be set. '
+        epilog='When using --friends or --all-friends, --steam-api-key must be set. '
                'Only Steam friends are supported, their game collections must be public.')
+    parser.add_argument('--tags', help='Export user tags for the games', action='store_true')
     parser.add_argument(
-        '--steam-id', help='Steam ID or vanity URL name (appears in the url of the profile page)')
-    parser.add_argument('--steam-api-key',
-                        help='Steam Web API key, get one here: https://steamcommunity.com/dev/apikey')
-    parser.add_argument('--all-friends', action='store_true',
-                        help='Show games owned by all friends')
-    parser.add_argument('--friends', nargs='+',
-                        help='Show games owned by listed friends, Steam ID or vanity URL name or pseudonym')
-    parser.add_argument('--gog-db', default=r'C:\ProgramData\GOG.com\Galaxy\storage\galaxy-2.0.db',
-                        help='Location of the GOG Galaxy database file galaxy-2.0.db')
+        '--steam-id',
+        help='Steam ID or vanity URL name (appears in the url of the profile page), can be retrieved from the GOG database when not set',
+        default=os.environ.get('STEAM_ID'),
+    )
+    parser.add_argument(
+        '--steam-api-key',
+        help='Steam Web API key, get one here: https://steamcommunity.com/dev/apikey',
+        default=os.environ.get('STEAM_API_KEY'),
+    )
+    parser.add_argument('--all-friends', action='store_true', help='Show games owned by all friends')
+    parser.add_argument(
+        '--friends', nargs='+',
+        help='Show games owned by listed friends, Steam ID or vanity URL name or pseudonym'
+    )
+    parser.add_argument(
+        '--gog-db',
+        help='Location of the GOG Galaxy database file galaxy-2.0.db',
+        default=os.environ.get('GOG_DB', r'C:\ProgramData\GOG.com\Galaxy\storage\galaxy-2.0.db'),
+    )
     arg = parser.parse_args()
     if arg.friends and arg.all_friends:
         print('--friends cannot be used with --all-friends', file=stderr)
         sys.exit(1)
-    if (arg.friends or arg.all_friends) and not (arg.steam_id and arg.steam_api_key):
-        print('When using --friends or --all-friends, both --steam-id and --steam-api-key must be set', file=stderr)
+    if (arg.friends or arg.all_friends) and not arg.steam_api_key:
+        print('When using --friends or --all-friends, --steam-api-key must be set', file=stderr)
         sys.exit(1)
     run(**vars(arg))

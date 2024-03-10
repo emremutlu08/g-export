@@ -87,7 +87,11 @@ const formatNum1 = (() => {
     return value => f.format(value).replace(',', "'");
 })();
 const yesNo = value => value ? 'yes' : 'no';
-const imageCell = params => params.value ? e('img', {src: params.value, class: 'icon', alt: ''}) : e('div', {class: 'noIcon'});
+const imageCell = params => params.value ? e('img', {
+    src: params.value,
+    class: 'icon',
+    alt: ''
+}) : e('div', {class: 'noIcon'});
 const platformsCell = ({value: v}) => e('span', {
         class: 'platforms',
         title: v.split(',').map(p => platformsInfo[p] || p).join('\n')
@@ -126,6 +130,8 @@ const ratingCell = ({value: v}) => e('span', {class: 'rating', title: `${v} star
 const friendsCell = ({value: v}) => v.length ? e('span',
     {class: 'friends', title: v.map(f => friendsInfo[f].name).join('\n')},
     v.map(f => e('img', {src: friendsInfo[f].icon, alt: friendsInfo[f].name}))) : null;
+const tagsCell = ({value: v}) => v.length ? e('span', {class: 'tags', title: v.join('\n')}, v.join(', ')) : null;
+const releaseDateCell = ({value: v}) => v ? e('span', {}, DateTime.fromSeconds(v, {zone: 'utc'}).toFormat('yyyy-MM-dd')) : null;
 const gridOptions = {
     columnDefs: [
         {
@@ -170,12 +176,30 @@ const gridOptions = {
             width: 110
         },
         {
+            headerName: "Released",
+            field: "releaseDate",
+            cellRenderer: releaseDateCell,
+            width: 100,
+            filterParams: {
+                textFormatter: v => (typeof v === 'number') ? DateTime.fromSeconds(v, {zone: 'utc'}).toFormat('yyyy-MM-dd') : v,
+            }
+        },
+        {
             field: "friends",
             hide: !showFriends,
             cellRenderer: friendsCell,
             width: 170,
             filterParams: {
                 textFormatter: t => t.map ? t.map(f => friendsInfo[f].name).join(',').toLowerCase() : t.toLowerCase()
+            }
+        },
+        {
+            field: "tags",
+            hide: !showTags,
+            cellRenderer: tagsCell,
+            width: 120,
+            filterParams: {
+                textFormatter: t => t.map ? t.join(',').toLowerCase() : t.toLowerCase()
             }
         }
     ],

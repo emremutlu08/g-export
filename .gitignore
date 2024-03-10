@@ -1,5 +1,8 @@
 .vscode
 .idea
+.env
 /cache
 /dist*
 __pycache__
+venv
+.venv

@@ -1,7 +1,10 @@
+from dataclasses import dataclass
+
+
+@dataclass
 class Platform:
-    def __init__(self, key, name):
-        self.key = key
-        self.name = name
+    key: str
+    name: str
 
 
 PLATFORMS = {p.key: p for p in [
