@@ -27,11 +27,18 @@ class GOG:
         GROUP BY releaseKey),
     steam_releases AS (SELECT allGameReleases, NULLIF(CAST(SUBSTR(json_each.value, 7) AS INTEGER), 0) steamRelease
         FROM r, json_each(r.allGameReleases, '$.releases')
-        WHERE json_each.value LIKE 'steam%')
+        WHERE json_each.value LIKE 'steam%'),
+    release_times AS (SELECT r.allGameReleases,
+        SUM(times.minutesInGame) total_time,
+        MAX(lastPlayed.lastPlayedDate) last_played_date
+        FROM r
+        LEFT JOIN GameTimes times USING (releaseKey)
+        LEFT JOIN LastPlayedDates lastPlayed ON r.releaseKey = lastPlayed.gameReleaseKey
+        GROUP BY r.allGameReleases)
     SELECT
         title,
-        SUM(times.minutesInGame) game_time,
-        MAX(lastPlayedDate) last_played,
+        rt.total_time game_time,
+        rt.last_played_date last_played,
         IFNULL(MAX(rating), 0) rating,
         MAX(summary) summary,
         GROUP_CONCAT(DISTINCT platform) platforms,
@@ -43,8 +50,7 @@ class GOG:
         MAX(meta) meta
     FROM r
         LEFT JOIN steam_releases USING (allGameReleases)
-        LEFT JOIN GameTimes times USING (releaseKey)
-        LEFT JOIN LastPlayedDates lastPlayed ON releaseKey = lastPlayed.gameReleaseKey
+        LEFT JOIN release_times rt USING (allGameReleases)
         LEFT JOIN ReleaseProperties prop USING (releaseKey)
         LEFT JOIN ProductPurchaseDates purchase ON releaseKey = purchase.gameReleaseKey
         LEFT JOIN UserReleaseProperties urp USING (releaseKey)
@@ -55,7 +61,7 @@ class GOG:
         ORDER BY title
     '''
             df = pandas.read_sql_query(query, con)
-            df['steam_ids'] = df['steam_ids'].apply(lambda x: x.split(',') if x else [])
+            df['steam_ids'] = df['steam_ids'].apply(lambda x: x.split(',') if isinstance(x, str) else [])
             df['all_releases'] = df['all_releases'].apply(lambda x: json.loads(x))
             df['tags'] = df['tags'].apply(lambda x: json.loads(x))
             df['meta'] = df['meta'].apply(lambda x: json.loads(x))

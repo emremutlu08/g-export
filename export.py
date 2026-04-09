@@ -94,7 +94,7 @@ def run(*, gog_db, tags=False, steam_id=None, steam_api_key=None, all_friends=Fa
         return None
 
     def get_game_info(row):
-        if row.steam_id:
+        if row.steam_id and isinstance(row.steam_id, str):
             return steam_db[row.steam_id]
         return None
 
@@ -116,13 +116,13 @@ def run(*, gog_db, tags=False, steam_id=None, steam_api_key=None, all_friends=Fa
     df['steam_id'] = df['steam_ids'].apply(get_steam_game_id)
     df['info'] = df.apply(get_game_info, axis=1)
     df['categories'] = df['info'].apply(get_categories)
-    df['icon_rel'] = df['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
-    df['cover_rel'] = df['cover'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
+    df['icon_rel'] = df['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if isinstance(x, str) else None)
+    df['cover_rel'] = df['cover'].apply(lambda x: IMAGE_CACHE.rel_path(x) if isinstance(x, str) else None)
 
     if len(unknown_categories):
         print(r'  ! Unknown Steam categories', ', '.join(str(c) for c in sorted(unknown_categories)), file=sys.stderr)
 
-    friends_info['icon_rel'] = friends_info['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if x else None)
+    friends_info['icon_rel'] = friends_info['icon'].apply(lambda x: IMAGE_CACHE.rel_path(x) if isinstance(x, str) else None)
     images = [
         *df['icon'].dropna(),
         *df['cover'].dropna(),
@@ -140,8 +140,8 @@ def run(*, gog_db, tags=False, steam_id=None, steam_api_key=None, all_friends=Fa
     row: GameInfoRow
     games_dump = [dict(
         title=row.title,
-        icon=str('img' / row.icon_rel).replace('\\', '/') if row.icon else None,
-        cover=str('img' / row.cover_rel).replace('\\', '/') if row.cover else None,
+        icon=str('img' / row.icon_rel).replace('\\', '/') if row.icon_rel is not None else None,
+        cover=str('img' / row.cover_rel).replace('\\', '/') if row.cover_rel is not None else None,
         platforms=row.platforms,
         categories=dict(
             single=SteamCategory.SINGLE_PLAYER in row.categories,
@@ -166,7 +166,7 @@ def run(*, gog_db, tags=False, steam_id=None, steam_api_key=None, all_friends=Fa
     friend_row: FriendsInfoRow
     friends_dump = {friend_row.Index: dict(
         name=friend_row.name,
-        icon=str('img' / friend_row.icon_rel).replace('\\', '/') if friend_row.icon else None
+        icon=str('img' / friend_row.icon_rel).replace('\\', '/') if friend_row.icon_rel is not None else None
     ) for friend_row in friends_info.itertuples()}
     platforms_dump = {p.key: p.name for p in PLATFORMS.values()}
     num_games = (df['hide'] == False).sum()
